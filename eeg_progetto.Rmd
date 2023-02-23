@@ -1,0 +1,1023 @@
+---
+title: \vspace{2.5in}Analisi Statistica di dati EEG
+subtitle: "Relazione di Psicometria per le Neuroscienze Cognitive"
+author: "Giovanni Corradini"
+affiliation: "Università di Padova"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+  pdf_document:
+    toc: true
+    toc_depth: 4
+toc-title: \vspace{3.5in}Indice
+fontsize: 12pt
+---
+
+
+
+\newpage
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+
+```
+
+```{r include=FALSE}
+## librerie utilizzate
+library(eeguana)
+library(tidyverse)
+library(car)
+library(multcomp)
+library(GGally)
+library(lmerTest)
+library(gamm4)
+library(flip)
+```
+
+
+
+```{r include=FALSE}
+## lettura dati in formato eeg_list
+source('eeg_functions.R')
+load('data_seg.RData')
+```
+
+
+
+
+# Introduzione \newline
+
+Questo progetto è un'analisi di dati *EEG* relativi ad un esperimento in cui è stata misurata la risposta cerebrale di 20 soggetti a 5 stimoli visivi (4 immagini di facce rappresentanti espressioni di digusto, paura, felicità e neutre e 1 immagine relativa ad un oggetto). \newline L'obiettivo del progetto è di analizzare le differenze fra i vari stimoli (in particolare tra gli stimoli delle facce e lo stimolo dell'oggetto) attorno al picco P170/N170, e di come tali differenze, se presenti, si manifestino tra le varie aree cerebrali (e tra i vari canali). Nell'analizzare tali differenze verranno confrontati sia vari metodi per la selezione e l'accorpamento delle osservazioni attorno al picco, sia vari approcci per saggiare e analizzare le differenze prodotte dai differenti stimoli nelle varie aree cerebrali. \newline Le analisi verranno svolte utilizzando *R* e appoggiandosi principalmente al pacchetto *eeguana*, che permette di strutturare e analizzare comodamente dati derivati dall'elettroencefalogramma, grazie alla sua forte affinità con il linguaggio *tidy*.
+
+
+# Dati \newline
+
+I dati a disposizione, relativi all'esperimento descritto in precedenza, sono già organizzati in una *eeg_lst*, oggetto principale del pacchetto *eeguana*. Questo oggetto è principalmente composto da una lista di 4 tibble, che contengono le misurazioni e le informazioni relative all'esperimento.
+
+```{r}
+dim(data_seg$.signal)
+```
+La tibble relativa ai segnali è quella contenente le misurazioni del potenziale, qui già accorpate con la media dei trials per soggetto e per condizione (sono gli *ERP*), in tutti i canali (in colonna), per tutti gli istanti temporali e per tutti i soggetti e le condizioni (in riga) relative all'esperimento. Nel nostro caso la tibble è formata da  50000 righe e  29 colonne: abbiamo 20 soggetti, ognuno esposto a 5 stimoli differenti e ognuno misurato per 500 istanti temporali (20x5x500 = 50000). Dopo aver rimosso gli elettrodi relativi ai canali RM, EOGvo, EOGvu, EOGhl e EOGhr, gli elettrodi presenti sullo scalpo sono 27; inoltre i dati sono già stati preprocessati (rimozione artefatti, segmentazione, accorpamento trials) e pertanto possono essere direttamente esplorati e analizzati. \newline
+
+I 27 canali utilizzati sono:
+```{r}
+names(data_seg$.signal)[-(1:2)]
+```
+
+
+```{r, include=FALSE}
+data_seg <- data_seg %>%
+  mutate(condition = fct_recode(factor(condition),
+                              f='1', h='2', d='3', n='4', o='5')) %>%
+  mutate(.subj = factor(.subj))
+
+```
+
+\newpage
+
+Le informazioni contenute nell'oggetto *eeg_lst* possono essere anche riorganizzate in una tibble *long format*, utile soprattutto in fase di esplorazione (*ggplot* internamente usa questa tibble) e di analisi.
+
+```{r}
+as_tibble(data_seg)
+```
+
+Ogni riga della tibble contiene l'ERP per un soggetto su un singolo canale in un dato istante temporale.
+Le variabili presenti nella tibble sono: \newline
+- .time : istante in cui si registra il potenziale (frequenza = 500 Hz) \newline
+- .id : fattore con 100 livelli indicanti soggetto * stimolo \newline
+- .subj : fattore con 20 livelli indicanti il soggetto \newline
+- condition : fattore con 5 livelli indicanti lo stimolo \newline
+- .key: fattore con 27 livelli rappresentante gli elettrodi \newline
+- .value: il valore del potenziale \newline 
+
+\newpage
+
+# Analisi Esplorativa \newline
+
+Per avere un'indicazione di massima della variabilità del segnale calcoliamo la varianza del potenziale per ogni canale separatamente:
+```{r}
+sort(apply(data_seg$.signal[,-(1:2)],2,var),decreasing=TRUE)[1:6]
+```
+i canali che presentano maggiore variabilità sono: PO7, PO8, P8, O1, P7 e O2. \newline
+I canali O1 e O2 sono relativi al lobo occipitale che è la porzione del cervello che regola la vista; questo ha senso per il nostro esperimento in quanto ai pazienti vengono somministrati stimoli visivi. \newline
+I canali P7 e P8 sono relativi al lobo parietale che, tra le sue funzioni, comprende quelle relative alle percezioni sensitive. \newline 
+I canali PO7 e PO8 sono al confine tra il lobo occipitale e quello parietale. \newline
+
+
+Facciamo un grafico che rappresenta gli ERP per tutti i soggetti e per tutte le condizioni (linee fine) e le  medie per condizione (linee spesse), divise per i 6 canali con maggior varianza. Tra l'altro questi 6 canali sono gli unici ad avere il picco N170 ben visibile: infatti gli altri canali o presentano il picco N170 poco marcato (P3 e P4), o presentano il picco P170, o non hanno picchi visibili nitidamente ad occhio nudo (lobo temporale).
+
+```{r}
+data_seg %>% as_tibble() %>% 
+  filter(.key %in% c('P7', 'P8', 'PO7', 'PO8', 'O1', 'O2')) %>%
+  ggplot(aes(x = .time, y = .value)) +
+  geom_line(alpha = 0.1,aes(group = .id, color = condition)) +
+  stat_summary(
+    fun = "mean", geom = "line", alpha = 1, size = 1,
+    aes(color = condition)) +
+  facet_wrap(~.key,scale='free') +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = .15, linetype = "dotted") +
+  ggtitle('Figura 1: ERP nei 6 canali più variabili',
+  subtitle='le linee spesse sono le medie per condizione degli ERP')
+```
+
+Facciamo ora il grafico degli ERP, facendo come sopra la media raggruppata per condizione su tutti i soggetti, ma invece che sui soli 6 canali più variabili,  su tutti i canali raggruppati per la rispettiva area cerebrale di riferimento, ovvero: \newline
+- *Frontale = media(Fp1, Fp2, F3, F4, F7, F8, Fz)* \newline
+- *Centro-Frontale = media(FC1, FC2, FCz)* \newline
+- *Centrale = media(C3, C4, Cz)* \newline
+- *Centro-Parietale = media(CP1, CP2, CPz)* \newline
+- *Temporale = media(T7, T8)* \newline
+- *Parietale = media(P3, P4, P7, P8, Pz)* \newline
+- *Parieto-Occipitale = media(PO7, PO8)* \newline
+- *Occipitale = media(O1, O2)*
+
+```{r}
+data_seg %>%
+  transmute(
+    Frontal = chs_mean(Fp1, Fp2, F3, F4, F7, F8, Fz),
+    Central_Frontal = chs_mean(FC1, FC2, FCz),
+    Central = chs_mean(C3, C4, Cz),
+    Central_Parietal = chs_mean(CP1, CP2, CPz),
+    Temporal = chs_mean(T7, T8),
+    Parietal = chs_mean(P3, P4, P7, P8, Pz),
+    Parietal_Occipital = chs_mean(PO7, PO8),
+    Occipital = chs_mean(O1, O2)) %>%
+  ggplot(aes(x = .time, y = .value)) +
+  geom_line(alpha = .1, aes(group = .id, color = condition)) +
+  stat_summary(
+    fun = "mean", geom = "line", alpha = 1, size = 1,
+    aes(color = condition)
+  ) +
+  facet_wrap(~.key, scale = 'free') +
+  geom_vline(xintercept = .15, linetype = "dotted") +
+  geom_vline(xintercept = .17, linetype = "dotted") +
+  theme(legend.position = c(0.85,0.15)) +
+  ggtitle('Figura 2: ERP nelle aree cerebrali',
+  subtitle='le linee spesse sono le medie per condizione degli ERP')
+```
+
+
+Da questi grafici si può notare come nel lobo temporale non sembra esservi una differenza fra le varie condizioni visibile nitidamente ad occhio nudo, mentre nei lobi frontale, centro-frontale, centrale, centro-parietale, parietale, occipitale e parieto-occipitale sembra esservi una differenza tra lo stimolo dell'oggetto e quelli relativi alle facce, in particolare attorno ai 150-170 ms. Tuttavia, nei lobi frontale, centro-frontale, centrale e centro-parietale la differenza di potenziale attorno al picco è positiva (P170), mentre nei lobi  parietale, occipitale e parieto-occipitale la differenza di potenziale è negativa (N170). \newline
+
+\newpage
+
+# Analisi N170/P170 \newline
+
+Ora, prima di procedere con le analisi statistiche, sono stati accorpati i valori dei potenziali attorno al picco N170/P170, così da ottenere un unico valore per ogni combinazione di persona, stimolo e canale (o area cerebrale) e perdendo quindi la dimensione temporale del fenomeno. Ci sono vari metodi per accorpare le osservazioni attorno al picco e qui ne confronteremo 3 (i più comunemente utilizzati): \newline
+
+1) accorpare i valori nell'intervallo 155-170 ms (senza contare i secondi pre-stimoli e arrotondando 155 a 154 in quanto abbiamo una sampling rate di 500 Hz) con la media, raggruppando per soggetto e condizione (per ogni canale separatamente) \newline
+
+2) accorpare i valori nell'intervallo 130-200 ms con il massimo,  raggruppando per soggetto e condizione (per ogni canale separatamente) \newline
+
+3) accorpare i valori nell'intervallo 50-200 ms, facendo la differenza tra il massimo nell'intervallo 50-130 ms e il minimo nell'intervallo 130-200 ms, raggruppando per soggetto e condizione (per ogni canale separatamente) \newline
+
+
+
+## 1° Metodo di accorpamento \newline
+
+Primo metodo di accorpamento (media nell'intervallo 155-170 ms)
+```{r}
+# accorpamento valori attorno al picco con 1° metodo
+data_1 <- iso_pick(data_seg, interval_ms = c(155,170), 
+                   sampl_rate_hz = 500, method = 'mean')
+```
+
+
+### Analisi per aree cerebrali \newline
+Accorpiamo con la media il potenziale dei vari canali nelle rispettive aree cerebrali e creiamo i contrasti per la condizione (lo stimolo) e l'area cerebrale, che verranno usati in fase di modellazione
+```{r}
+# sistemazione dati
+db_1a <- data_1 %>%
+  transmute_area() %>% # accorpo i canali in aree cerebrali 
+  as_tibble() %>%
+  mutate(.key = factor(.key))
+
+# gestione contrasti
+contrasts(db_1a$condition) <- contr.sum
+contrasts(db_1a$.key) <- contr.sum
+```
+
+
+#### Modello Lineare \newline
+
+Adattiamo un modello lineare sui dati accorpati col primo metodo, utilizzando come covariate: l'area cerebrale, la condizione, il soggetto e l'interazione tra area e condizione
+
+```{r}
+# modello lineare
+mod_1_1a <- lm(.value~ 0 + .key * condition + .subj, data = db_1a)
+Anova(mod_1_1a, type=3, p.adjust.methods=TRUE) # holm
+```
+Gli effetti delle variabili esplicative che nel modello emergono significativamente diversi da zero sono quelli relativi all'area cerebrale e all'interazione tra la condizione (lo stimolo) e l'area cerebrale. La non significativa differenza da zero dell'effetto della condizione è probabilmente da attribuire al fatto che in alcune aree cerebrali questa differenza è positiva (aree con picco positivo/P170) mentre in alcune è negativa (aree con picco negativo/N170); a conferma di ciò c'è l'elevata significatività contro l'ipotesi di uguaglianza a zero dell'effetto dell'interazione tra l'area cerebrale e la condizione.
+
+```{r}
+summary(glht(mod_1_1a,type='holm'))
+```
+
+Correggendo i p-values del modello appena adattato con il metodo di *Bonferroni-Holm* si ha che sono risultati significativamente (e altamente) diversi da zero solamente i coefficienti realtivi agli effetti principali delle aree cerebrali e quelli relativi alle interazioni tra stimolo *fear* e area *parieto-occipitale* e tra *disgust* e area *parieto-occipitale*. In particolare queste ultime sono le interazioni tra la *differenza fra stimolo fear e oggetto* e la *differenza fra area parieto-occipitale e temporale*, e la *differenza fra stimolo disgust e oggetto* e tra la *differenza fra area parieto-occipitale e temporale*: entrambe hanno segno negativo indicando che nell'area parieto-occipitale lo stimolo del disgusto (/della paura) genera un potenziale minore (un picco negativo più marcato) rispetto allo stimolo dell'oggetto di quanto non fa nell'area temporale.
+
+```{r message=FALSE, warning=FALSE}
+ggplot(data=data.frame(Residuals = residuals(mod_1_1a), 
+       Fitted = fitted.values(mod_1_1a), subj=db_1a$.subj))+
+  geom_point(aes(x=Fitted, y=Residuals,color=subj)) + 
+  geom_smooth(aes(x=Fitted, y=Residuals)) +
+  theme(legend.position = "none") +
+  ggtitle('Figura 3: Residuals vs Fitted (per area cerebrale)',
+  subtitle='modello lineare su dati accorpati con 1° metodo')
+```
+
+```{r}
+db_1a %>% cbind(.resid = residuals(mod_1_1a)) %>%
+  ggplot(aes(condition,.resid)) +
+  geom_point(aes(group = .subj, colour = .subj),
+             size=2,show.legend = FALSE) +
+  geom_line(aes(group = .subj, colour = .subj),
+            show.legend = FALSE) +
+  geom_boxplot(alpha=.1) +
+  facet_wrap(~.key, scale = 'free') +
+  ggtitle('Figura 4: Boxplot Residui (per area cerebrale)',
+        subtitle='modello lineare su dati accorpati con 1° metodo')
+```
+
+```{r}
+summary(mod_1_1a)$adj.r.squared
+```
+
+Lo scatter plot dei residui contro i valori predetti, se guardato nel complesso, non sembra mostrare forti scostamenti dalle assunzioni del modello e inoltre l'adattamento del modello ai dati non sembra mostrare grossi problemi ($R^2 corretto=76\%$). Tuttavia, come emerge dalla *Figura 4* e dai colori di *Figura 3*, non è stato sufficiente introdurre nel predittore lineare il fattore relativo ai soggetti per cogliere appieno l'effetto soggetto-specifico del fenomeno
+
+```{r}
+tibble(.residuals = mod_1_1a$residuals, .key = db_1a$.key) %>%
+  pivot_wider(names_from = .key, values_from = .residuals) %>%
+  apply(2,unlist) %>% ggcorr() + 
+  ggtitle('Figura 5: Correlazione tra i Residui Stratificati (per canale)',
+          subtitle='modello lineare su dati accorpati con 1° metodo')
+```
+Inoltre non è stato tenuto in considerazione il fatto che è presente una forte correlazione nel potenziale fra le varie aree cerebrali.
+
+#### Modello Lineare con più interazioni \newline
+
+Per riuscire a cogliere meglio la specificità dei soggetti (intanto occupiamoci di questo primo problema) si possono introdurre, tra le covariate del modello precedente, anche le interazioni tra soggetto e stimolo e tra soggetto e area cerebrale.
+
+```{r}
+# modello lineare con aggiunta interazioni tra
+# soggetto e stimolo, e soggetto e area cerebrale
+mod_1_2a <- lm(.value~.subj*.key+condition*.subj+condition:.key,data=db_1a)
+Anova(mod_1_2a,mod_1_1a,ype=3,p.adjust.methods=TRUE)
+```
+
+Da questo modello risultano significativamente diverse da zero gli aumenti di varianza spiegata apportati dall'introduzione (rispetto al modello precedente) dell'interazione tra soggetto e area cerebrale, mentre non risultano essere significativamente diverse da zero gli aumenti di varianza spiegata apportati dall'introduzione dell'interazione tra soggetto e condizione: questo risultato, anche in questo caso come nel precedente, è probabilmente dovuto dal fatto che la differenza fra i vari stimoli delle facce e lo stimolo dell'oggetto, seppur quasi in tutte le aree abbastanza marcata, è positiva in alcune aree e negativa in altre, pertanto il 'segno' di queste condizioni viene dipende dall'area cerebrale, e non dal soggetto.
+
+```{r}
+summary(mod_1_2a)
+```
+
+```{r message=FALSE, warning=FALSE}
+ggplot(data=data.frame(Residuals = residuals(mod_1_2a), 
+       Fitted = fitted.values(mod_1_2a), subj=db_1a$.subj)) +
+  geom_point(aes(x=Fitted, y=Residuals,color=subj)) + 
+  geom_smooth(aes(x=Fitted, y=Residuals)) +
+  theme(legend.position = "none") +
+  ggtitle('Figura 6: Residuals vs Fitted (per area cerebrale)',
+  subtitle='modello lineare con più interazioni su dati accorpati con 1° metodo')
+```
+
+```{r}
+db_1a %>% cbind(.resid = residuals(mod_1_2a)) %>%
+  ggplot(aes(condition,.resid)) +
+  geom_point(aes(group = .subj, colour = .subj),
+             size=2,show.legend = FALSE) +
+  geom_line(aes(group = .subj, colour = .subj),
+            show.legend = FALSE) +
+  geom_boxplot(alpha=.1) +
+  facet_wrap(~.key, scale = 'free') +
+  ggtitle('Figura 7: Boxplot Residui (per area cerebrale)',
+  subtitle='modello lineare con più interazioni su dati accorpati con 1° metodo')
+```
+```{r}
+summary(mod_1_2a)$adj.r.squared
+```
+
+Introducendo tutte le interazioni a coppie fra *area cerebrale, condizione e soggetto* si nota come sia lo scatterplot dei residui contro i valori previsti che il grafico dei boxplot dei residui non mostrino i problemi del modello precedente (riescono meglio a cogliere l'effetto specifico del soggetto) e inoltre l'adattamento del modello ai dati è notevolmente superiore al precedente ($R^2 corretto = 96\%$). \newline Tuttavia l'aggiunta di così tanti parametri (di cui la maggior parte non significativi) riduce l'interpretabilità e la parsimonia del modello (aumentandone la complessità in modo inutile) e fa optare quindi per altri tipi di modellazione.
+
+#### Modello Lineare ad Effetti Misti \newline
+
+Un approccio semplice per eliminare la specificità dei soggetti utilizzando comunque un modello lineare, ma senza utilizzare troppe covariate, è quello di adattare il modello utilizzando il potenziale scalato per le medie soggetto specifiche (qui non riportato in quanto fornisce risultati molto simili al modello lineare con *soggetto* come covariata). \newline
+Un modello che può spiegare le differenze nel potenziale tra stimoli e aree, tenendo conto della specificità del soggetto ma senza perdere informazione, è quello dei modelli ad effetti misti, qui adattati con intercette (relative ai soggetti) e coefficienti (relativi alle aree cerebrali) casuali.
+
+```{r}
+# modello lineare ad effetti misti
+mod_1_3a <- lmer(.value~ 0 + .key * condition + (.key|.subj), data=db_1a)
+Anova(mod_1_3a,type=3,p.adjust.methods=TRUE)
+```
+L'effetto di tutte e 3 le variabili risulta essere significativamente diverso da zero
+
+
+```{r}
+summary(glht(mod_1_3a,type='holm'))
+```
+I coefficienti dei parametri relativi alle aree cerebrali (differenza tra aree cerebrali e area temporale) e quelli relativi alle interazioni tra sitmolo fear/disgust (differenza tra fear/disgust e object) e area cerebrale risultano essere tutti significativamente diversi da zero; per tutti gli altri coefficienti tale risultato non è valido. \newline
+
+Guardiamo qualche contrasto specifico, corregendo il p-value per confronti multipli.
+```{r}
+contr <- rbind("d - o" = c(rep(0,8),c(0,0,1,0),rep(0,28)),
+               "f - o" = c(rep(0,8),c(1,0,0,0),rep(0,28)),
+               "n - o" = c(rep(0,8),c(0,0,0,1),rep(0,28)),
+               "d - n" = c(rep(0,8),c(0,0,1,-1),rep(0,28)))
+
+summary(glht(mod_1_3a, linfct = contr,type='holm'))
+```
+Solo la differenza fra stimolo del disgusto e stimolo dell'oggetto risulta essere significativamente diversa da zero; tuttavia dobbiamo tenere in considerazione che stiamo guardando solo l'effetto principale di tale variabile, senza osservare l'interazione tra questa e l'area cerebrale.
+
+
+```{r message=FALSE, warning=FALSE}
+ggplot(data=data.frame(Residuals = residuals(mod_1_3a), 
+       Fitted = fitted.values(mod_1_3a), subj=db_1a$.subj)) +
+  geom_point(aes(x=Fitted, y=Residuals,color=subj)) + 
+  geom_smooth(aes(x=Fitted, y=Residuals)) +
+  theme(legend.position = "none") +
+  ggtitle('Figura 8: Residuals vs Fitted (per area cerebrale)',
+  subtitle='modello lineare ad effetti misti su dati accorpati con 1° metodo')
+```
+
+```{r}
+db_1a %>% cbind(.resid = residuals(mod_1_3a)) %>%
+  ggplot(aes(condition,.resid)) +
+  geom_point(aes(group = .subj, colour = .subj),
+             size=2,show.legend = FALSE) +
+  geom_line(aes(group = .subj, colour = .subj),
+            show.legend = FALSE) +
+  geom_boxplot(alpha=.1) +
+  facet_wrap(~.key, scale = 'free') +
+  ggtitle('Figura 9: Boxplot Residui (per area cerebrale)',
+  subtitle='modello lineare ad effetti misti su dati accorpati con 1° metodo')
+```
+```{r}
+AIC(mod_1_1a)
+AIC(mod_1_3a)
+```
+L'adattamento di tale modello è notevolmente superiore rispetto al primo modello lineare (AIC ridotto di più di un terzo) e inoltre i due grafici dei residui (*Figura 8 e 9*) mostrano come l'aggiunta dei coefficienti casuali relativi ai soggetti e alle aree cerebrali sia riuscita a far sì che venissero presi in considerazione gli effetti soggetto-specifici presenti nel fenomeno in maniera soddisfacente. \newline Tuttavia per ora non è stato preso seriamente in considerazione il fatto che vi è una forte correlazione tra le varie aree cerebrali (anche se introducendo l'effetto casuale relativo all'area cerebrale ne abbiamo tenuto un po' conto)
+
+#### Modello Lineare Multivariato \newline
+Un approccio per analizzare le differenze fra le varie condizioni (ancora, in particolare fra gli stimoli delle facce e lo stimolo dell'oggetto) simultaneamente per tutte le aree cerebrali è il modello lineare multivariato
+
+```{r}
+# trasformazione dati in wide-format
+tbl_1_ma <- data.frame(matrix(unlist(tapply(db_1a$.value,db_1a$.key,
+                                           function(x) x)),nrow=100,ncol=8),
+                      tapply(db_1a$condition,db_1a$.key,function(x) x)$Frontal,
+                      tapply(db_1a$.subj,db_1a$.key,function(x) x)$Frontal)
+
+colnames(tbl_1_ma) <- c(unique(as.character(db_1a$.key)),'condition','.subj')
+contrasts(tbl_1_ma$condition) <- contr.sum
+```
+
+```{r}
+# modello lineare multivariato
+mod_1_4a <- lm(cbind(Frontal, Central_Frontal, Central, Central_Parietal, 
+                   Temporal,Parietal, Parietal_Occipital, Occipital) ~ 
+               0 + .subj + condition, data = tbl_1_ma)
+Manova(mod_1_4a, type=3, p.adjust.methods = TRUE)
+```
+
+```{r}
+db_1a %>% cbind(.resid = as.vector(residuals(mod_1_4a))) %>%
+  ggplot(aes(condition,.resid)) +
+  geom_point(aes(group = .subj, colour = .subj),
+             size=2,show.legend = FALSE) +
+  geom_line(aes(group = .subj, colour = .subj),
+            show.legend = FALSE) +
+  geom_boxplot(alpha=.1) +
+  facet_wrap(~.key, scale = 'free') +
+  ggtitle('Figura 10: Boxplot Residui (per area cerebrale)',
+  subtitle='modello lineare multivariato su dati accorpati con 1° metodo')
+```
+
+```{r}
+for(i in 1:8){print(summary(mod_1_4a)[[i]]$adj.r.squared)}
+```
+
+L'analisi della varianza multivariata ha mostrato che entrambe le variabili hanno un effetto congiunto (sulle risposte) significativamente diverso da zero. Inoltre i boxplot dei residui (divisi per area cerebrale) e gli elevati $R^2 corretti$ indicano un buon adattamento e un'elevata capacità di cogliere gli effetti soggetto-specifici di tali modelli. \newline Tuttavia non si è ancora risolto il problema della dipendenza tra aree cerebrali, in quanto adattare un modello lineare multivariato sulle aree cerebrali è come adattare dei modelli lineari separati, uno per ogni area cerebrale (e pertanto adattare un modello lineare con effetti casuali relativi alle aree sui dati in long-format allevia almeno in parte il problema della correlazione fra le aree, a differenza del modello lineare multivariato)
+
+#### Test di Permutazione Multivariati \newline
+
+Un diverso approccio che si può adottare per tenere in considerazione sia gli effetti soggetto-specifici delle misurazioni, sia il fatto che queste sono correlate, è quello basato sui test di permutazione. In particolare utilizziamo la libreria *flip* per fare un test di permutazione multivariato, con il potenziale sulle aree cerebrali come risposta 8-dimensionale e la condizione (sempre utilizzando i contrasti e trattando l'oggetto come "riferimento") come fattore d'interesse; inoltre, impostando *Z=~.subj*, stiamo assumendo che l'effetto del soggetto verrà trattato come variabile confondente e che pertanto verranno stimati i coefficienti relativi ai parametri del modello sui dati in deviazione dalle medie soggetto-specifiche.
+```{r}
+tbl_1_ma$condition <- relevel(tbl_1_ma$condition, ref = 'o')
+mod_1_5a <- flip(.~condition, Z=~.subj, data=tbl_1_ma, perms=1000) # Strata = ~.subj
+summary(flip.adjust(mod_1_5a,method='fdr'))
+```
+Per tenere sotto controllo l'errore di primo tipo in un contesto come questo in cui vengono effettuati molteplici test simultaneamente, è stato utilizzato un approccio basato sul *fdr* (procedura di Benjamini-Hochberg)
+
+```{r}
+npc(mod_1_5a)
+```
+
+```{r}
+s_m_res <- flip.adjust(mod_1_5a,method='fdr')@res
+t_valz <- matrix(s_m_res[,2],nrow=4,ncol=8,byrow=FALSE)
+nomi_aree <- names(tbl_1_ma)[1:8]
+
+data_1 %>% 
+  group_by(condition) %>%
+  summarize_at(channel_names(.),mean) %>%
+  filter(condition %ni% c('d','n')) %>%
+  replace_chan(nomi_aree,t_valz[1:2,],area=TRUE) %>%
+  filter(condition != 'o') %>%
+  plot_topo() +
+  annotate_head() +
+  geom_contour() +
+  geom_text(colour = "black") +
+  facet_grid(~condition,scale='free') +
+  ggtitle('Figura 11: Stat test di permutazione multivariata (fear/happiness vs obj)',
+          subtitle='Dati accorpati con 1° metodo, analisi per aree cerebrali')
+```
+
+
+```{r}
+data_1 %>% 
+  group_by(condition) %>%
+  summarize_at(channel_names(.),mean) %>%
+  filter(condition %ni% c('f','h')) %>%
+  replace_chan(nomi_aree,t_valz[3:4,],area=TRUE) %>%
+  filter(condition != 'o') %>%
+  plot_topo() +
+  annotate_head() +
+  geom_contour() +
+  geom_text(colour = "black") +
+  facet_grid(~condition,scale='free') +
+  ggtitle('Figura 12: Stat test di permutazione multivariata (disgust/neutral vs obj)',
+          subtitle='Dati accorpati con 1° metodo, analisi per aree cerebrali')
+```
+Le analisi grafiche mostrano i valori delle statistiche test relativi alle differenze fra gli stimoli delle facce di paura e di felicità rispetto all'oggetto (Figura 11) e alle differenze fra gli stimoli delle facce di disgusto e neutrali rispetto all'oggetto (Figura 12) per le varie aree cerebrali, ottenuti tramite i test di permutazione multivariati appena adattati. \newline I risultati di tali grafici mostrano come le differenze più marcate fra gli stimoli delle facce e quello dell'oggetto siano quelle relative alle facce di paura e di disgusto. Inoltre tali coefficienti mostrano come per tali condizioni, in alcune aree queste differenze siano positive, mentre in altre negative (riflettendo le aree in cui è presente il picco P170/N170)
+
+
+### Analisi per canali \newline
+
+Analizziamo ancora i dati accorpati con il primo metodo, ma questa volta senza accorpare i canali in aree cerebrali
+
+```{r}
+# sistemazione dati
+db_1 <- data_1 %>%
+  as_tibble() %>%
+  mutate(.key = factor(.key))
+
+# definizione contrasti
+contrasts(db_1$condition) <- contr.sum
+contrasts(db_1$.key) <- contr.sum
+```
+
+
+#### Modello Lineare ad Effetti Misti \newline
+
+Iniziamo adattando un modello lineare ad effetti misti, utilizzando come effetti fissi il canale (senza intercetta per facilità d'interpretazione e per non scegliere un canale di riferimento), la condizione e l'interazione fra i due ed introducendo delle intercette casuali relative al soggetto e dei coefficienti casuali (correlati con le intercette casuali) relativi al canale. \newline A causa dell'elevata complessità computazionale richiesta dalla stima di tale modello, come funzione per l'adattamento del modello non è stata utilizzata *lmer* (del pacchetto *lmerTest*) come in precedenza, ma bensì *gam* (pacchetto *gamm4*) che riesce a stimare il modello in tempi molto più ragionevoli (e fornisce risultati equivalenti a *lmer*)
+
+```{r}
+# modello lineare ad effetti misti
+mod_1_1 <- gam(.value~0+ .key * condition + s(.key, .subj, bs = 're'),
+                data = db_1, method = 'REML')
+anova(mod_1_1)
+```
+Come nel caso dell'adattamento dello stesso modello sui dati con i canali accorpati per area, è risultato che tutte e 3 le variabili esplicative hanno apportato una riduzione di varianza residua significativamente diversa da zero nel modello.
+
+
+```{r}
+summary(mod_1_1)
+```
+Anche qui come nel modello adattato utilizzando i canali raggruppati in aree cerebrali si ha che i coefficienti dei parametri risultati significativamente diversi da zero sono principalmente quelli relativi ai canali e alle interazioni tra sitmolo fear/disgust (differenza tra fear/disgust e object) e i canali (con qualche eccezione per le interazioni tra canale e gli altri due stimoli)
+
+```{r message=FALSE, warning=FALSE}
+ggplot(data=data.frame(Residuals = residuals(mod_1_1), 
+       Fitted = fitted.values(mod_1_1), subj=db_1$.subj)) +
+  geom_point(aes(x=Fitted, y=Residuals,color=subj)) + 
+  geom_smooth(aes(x=Fitted, y=Residuals)) +
+  theme(legend.position = "none") +
+  ggtitle('Figura 13: Residuals vs Fitted (per canale)',
+  subtitle='modello lineare ad effetti misti su dati accorpati con 1° metodo')
+```
+
+
+```{r}
+db_1 %>% cbind(.resid = residuals(mod_1_1)) %>%
+  ggplot(aes(condition,.resid)) +
+  geom_point(aes(group = .subj, colour = .subj),
+             size=2,show.legend = FALSE) +
+  geom_line(aes(group = .subj, colour = .subj),
+            show.legend = FALSE) +
+  geom_boxplot(alpha=.1) +
+  facet_wrap(~.key, scale = 'free') +
+  ggtitle('Figura 14: Boxplot Residui (per canale)',
+  subtitle='modello lineare ad effetti misti su dati accorpati con 1° metodo')
+```
+Il grafico dei residui (figura 13) non sembra mostrare relazioni tra le variabili non colte dal modello e i boxplot dei residui (figura 14) mostrano come anche in questo caso l'introduzione di effetti casuali nel modello permette di cogliere la specificità dei soggetti; inoltre l'elevato valore dell'$R^2aggiustato$ ($96\%$) indica un buon adattamento del modello ai dati
+
+```{r}
+tibble(.value = db_1$.value, .key = db_1$.key) %>%
+  pivot_wider(names_from = .key, values_from = .value) %>%
+  apply(2,unlist) %>% ggcorr() + 
+  ggtitle('Figura 15: Correlazione tra il potenziale nei vari canali',
+          subtitle='modello lineare ad effetti misti su dati accorpati con 1° metodo')
+```
+
+```{r}
+tibble(.residuals = mod_1_1$residuals, .key = db_1$.key) %>%
+  pivot_wider(names_from = .key, values_from = .residuals) %>%
+  apply(2,unlist) %>% ggcorr() + 
+  ggtitle('Figura 16: Correlazione tra i Residui Stratificati (per canale)',
+          subtitle='modello lineare ad effetti misti su dati accorpati con 1° metodo')
+```
+
+Tuttavia, come nell'analisi per aree cerebrali, modellando la "tibble in long format" dei dati stiamo ignorando la natura multivariata del fenomeno; anche se, guardando ai grafici soprastanti (Figure 15 e 16), si può notare che un po' di correlazione tra i canali è stata colta dal modello, cosa che è stata resa possibile dall'introduzione degli effetti casuali relativi ai canali
+
+#### Test di Permutazione Multivariati \newline
+
+Un approccio che tiene in considerazione in maniera più opportuna sia le dipendenze tra canali che gli effetti soggetto-specifici è quello basato sui test di permutazione multivariati. Come nel caso dell'analisi per aree cerebrali, anche qui tratteremo il soggetto come una variabile confondente, il cui effetto va rimosso per potersi concentrare sull'effetto della variabile principale (la condizione)
+```{r}
+# creazione tibble in large-format per analisi multivariata
+tbl_1_m <- data.frame(matrix(unlist(tapply(db_1$.value,db_1$.key,
+                                           function(x) x)),nrow=100,ncol=27),
+                      tapply(db_1$condition,db_1$.key,function(x) x)$C4,
+                      tapply(db_1$.subj,db_1$.key,function(x) x)$C4)
+
+colnames(tbl_1_m) <- c(unique(as.character(db_1$.key)),'condition','.subj')
+
+tbl_1_m$condition <- relevel(tbl_1_m$condition, ref = 'o')
+```
+
+```{r}
+# test di permutazione 27-dim con 10K di permutazioni
+mod_1_2 <- flip(.~condition, Z=~.subj, data=tbl_1_m, perms=1e4) # Strata = ~.subj
+summary(mod_1_2)
+```
+Senza correggere i singoli p-values per confronti multipli, risultano essere significativamente diversi da zero praticamente tutti i coefficienti relativi agli stimoli *fear* e *disgust*, mentre quasi nessun coefficiente relativo agli stimoli *happiness* e *neutral* è risultato essere significativamente diverso da zero
+
+```{r}
+summary(flip.adjust(mod_1_2,method='fdr'))
+```
+Aggiustando i p-values tenendo conto del *false discovery rate* la situazione riguardo la significativa differenza da zero per i coeficienti non è cambiata di molto: infatti si è "persa" solamente la significatività per i coefficienti relativi agli stimoli *happiness* e *neutral*
+
+```{r}
+summary(flip.adjust(mod_1_2,method='maxT'))
+```
+Gli unici coefficienti che dopo aver aggiustato i p-values con il metodo *maxT* sono risultati essere significativamente diversi da zero sono quelli relativi allo stimolo del *disgusto* per i canali *FC2*, *C4* e *P4* (fatto presumibile data la maggior severità nel controllo della molteplicità data dal metodo *maxT* rispetto all'*fdr*)
+```{r}
+npc(mod_1_2)
+```
+Il p-value complessivo indica comunque un effetto della condizione significativamente diverso da zero globalmente su tutti i canali \newline Per visualiizzare meglio i risultati del test di permutazione utilizziamo *plot_topo* (che costruisce un plot topografico a partire da una *eeg_lst* contenente informazioni sulla posizione dei canali) in cui vengono mostrati i valori delle statistiche test (Figura 17) e dei $-log(p-values\ \ aggiustati)$ (Figura 18) derivati dai test di permutazione, relativi al confronto fra *fear* e *oggetto* e tra *happiness* e *oggetto* (in figura 17, mentre in figura 18 si mostrano i confronti tra *fear* e *oggetto* e tra *disgust* e *oggetto*) per tutti i canali.
+```{r}
+nomi_chans <- names(tbl_1_m)[1:27]
+s_m_res <- flip.adjust(mod_1_2,method='maxT')@res
+t_valz <- matrix(s_m_res[,2],nrow=4,ncol=27,byrow=FALSE)
+
+data_1 %>% 
+  group_by(condition) %>%
+  summarize_at(channel_names(.),mean) %>%
+  filter(condition %ni% c('d','n')) %>%
+  replace_chan(nomi_chans,t_valz[3:4,]) %>%
+  filter(condition != 'o') %>%
+  plot_topo() +
+  annotate_head() +
+  geom_contour() +
+  geom_text(colour = "black") +
+  facet_grid(~condition,scale='free') +
+  ggtitle('Figura 17: Stat-values test di permutazione multivariata (fear/happiness vs obj)',
+          subtitle='Dati accorpati con 1° metodo, analisi per canali')
+```
+I grafici mostrano come siano molto più evidenti le differenze tra lo stimolo della paura e
+quello dell’oggetto rispetto alle differenze fra lo stimolo della felicità e quello dell’oggetto. In particolare, per quanto riguarda lo stimolo della paura, si ha che risulta esservi una differenza negativa (tra paura e oggetto) nei canali relativi alle aree centro-frontale, centro-parietale, parietale (non P7 e P8) e occipitale, mentre questa differenza risulta essere positiva nelle restanti aree (con l’area parieto-occipitale al limite tra i due tipi di aree)
+
+```{r}
+
+p_valz <- matrix(-log(s_m_res[,5]),nrow=4,ncol=27,byrow=FALSE)
+
+data_1 %>% 
+  group_by(condition) %>%
+  summarize_at(channel_names(.),mean) %>%
+  filter(condition %ni% c('h','n')) %>%
+  replace_chan(nomi_chans,p_valz[c(1,3),]) %>%
+  filter(condition != 'o') %>%
+  plot_topo() +
+  annotate_head() +
+  geom_contour() +
+  geom_text(colour = "black") +
+  facet_grid(~condition,scale='free') +
+  ggtitle('Figura 18: -log(adj-p-values) test di permutazione multivariata (fear/disgust vs obj)',
+          subtitle='Dati accorpati con 1° metodo, analisi per canali')
+```
+I $-log(p-values \ \ aggiustati)$ (secondo il metodo *maxT*) per le differenze fra stimoli di disgusto e di paura con quelli dell'oggetto mostrano come le aree in cui queste differenze sono tendenzialmente più marcate sono le aree centrale, frontale e temporale destre (in particolare per lo stimolo del disgusto), mentre per entrambi gli stimoli l'area parieto-occipitale sembra essere quella dove queste differenze risultano essere meno marcate
+
+
+
+## 2° Metodo di accorpamento \newline
+
+Ora procediamo con le analisi con i dati accorpati secondo il secondo metodo (con il massimo valore nell'intervallo 130-200 ms), per vedere se ci sono differenze sostanziali con il primo metodo di accorpamento.
+```{r}
+# accorpamento con il secondo metodo
+data_2 <- iso_pick(data_seg, interval_ms = c(130,200), 
+                   sampl_rate_hz = 500, method = 'max')
+```
+
+### Analisi per canali \newline
+
+Le analisi verranno effettuate direttamente sui dati non accorpati per area (tendendo direttamente il canale) per semplicità di esposizione e in quanto spesso i due approcci d'analisi hanno molti punti in comune
+```{r}
+# sistemazione dati
+db_2 <- data_2 %>%
+  as_tibble() %>%
+  mutate(.key = factor(.key))
+
+# gestione contrasti
+contrasts(db_2$condition) <- contr.sum
+contrasts(db_2$.key) <- contr.sum
+
+```
+
+#### Modello Lineare ad Effetti Misti \newline
+
+Ora adattiamo sui dati direttamente un modello a effetti misti, perchè per ora sembra essere il modello con un miglior adattamento ai dati, perchè tiene considerazione (in parte) la correlazione presente fra i canali e perchè può essere adattato direttamente sui dati in *long-format*
+
+```{r}
+# modello lineare ad effetti casuali
+mod_2_1 <-  gam(.value~0+ .key * condition + s(.key, .subj, bs = 're'),
+                data = db_2, method = 'REML')
+anova(mod_2_1)
+```
+Anche qui, come nel modello ad effetti misti adattato sui dati accorpati con la media, si ha che globalmente sia la variabile relativa al canale, che quella relativa alla condizione, che la loro interazione risultano ridurre in maniera sinificativamente diversa da zero la varianza residua del modello 
+
+```{r}
+summary(mod_2_1)
+```
+
+Anche qui, come nel modello ad effetti misti adattato sui dati accorpati con la media, si ha che i coefficienti dei parametri risultati significativamente diversi da zero sono principalmente quelli relativi ai canali e quelli relativi alle interazioni tra sitmolo fear/disgust (differenza tra fear/disgust e object) e i canali (con qualche eccezione per le interazioni tra canale e lo stimolo *happiness*). Inoltre sono risultati significativamente diversi da zero anche i coefficienti relativi agli effetti principali delle condizioni *fear, happiness e disgust* (coefficienti relativi alle differenze tra questi stimoli e lo stimolo dell'*oggetto*) e con segno positivo: pertanto con questo metodo di accorpamento si ha che l'effetto principale degli stimoli riguarda principalmente i canali con il picco positivo.
+
+
+
+```{r message=FALSE, warning=FALSE}
+ggplot(data=data.frame(Residuals = residuals(mod_2_1), 
+       Fitted = fitted.values(mod_2_1), subj=db_2$.subj)) +
+  geom_point(aes(x=Fitted, y=Residuals,color=subj)) + 
+  geom_smooth(aes(x=Fitted, y=Residuals)) +
+  theme(legend.position = "none") +
+  ggtitle('Figura 19: Residuals vs Fitted (per canale)',
+  subtitle='modello lineare ad effetti misti su dati accorpati con 2° metodo')
+```
+
+```{r}
+tibble(.residuals = mod_2_1$residuals, .key = db_2$.key) %>%
+  pivot_wider(names_from = .key, values_from = .residuals) %>%
+  apply(2,unlist) %>% ggcorr() + 
+  ggtitle('Figura 20: Correlazione tra i Residui Stratificati (per canale)',
+          subtitle='modello lineare ad effetti misti su dati accorpati con 2° metodo')
+```
+
+Il grafico dei residui e l'elevato $R^2$ corretto (92%) indicano un soddisfacente adattamento del modello ai dati. \newline Tuttavia, anche se utilizzando questo metodo di accorpamento la correlazione tra i canali si è ridotta (figura 20) rispetto all'utilizzo del primo metodo (figura 16), può essere più corretto procedere, come fatto in precedenza, utilizzando un approccio basato sui test di permutazione
+
+
+#### Test di Permutazione Multivariati \newline
+
+Come per il primo metodo di accorpamento effettuiamo un test di permutazione multivariato (congiuntamente sul potenziale nei 27 canali), utilizzando come covariata d'interesse la condizione (lo stimolo) e trattando il soggetto come variabile confondente
+```{r}
+# creazione tibble in wide-format per l'analisi 27-dim
+tbl_2_m <- data.frame(matrix(unlist(tapply(db_2$.value,db_2$.key,
+                                           function(x) x)),nrow=100,ncol=27),
+                      tapply(db_2$condition,db_2$.key,function(x) x)$C4,
+                      tapply(db_2$.subj,db_2$.key,function(x) x)$C4)
+
+colnames(tbl_2_m) <- c(unique(as.character(db_2$.key)),'condition','.subj')
+
+tbl_2_m$condition <- relevel(tbl_2_m$condition, ref = 'o')
+
+```
+
+```{r}
+# test di permutazione multivariato
+mod_2_2 <- flip(.~condition, Z=~.subj, data=tbl_2_m, perms=1000) # Strata = ~.subj
+summary(flip.adjust(mod_2_2,method='maxT'))
+
+```
+```{r}
+npc(mod_2_2)
+```
+
+Attuando una procedura di controlo della molteplicità basata sul metodo *maxT* nessun singolo coefficiente testato è risultato essere significativamente diverso da zero; tuttavia, nel complesso, l'effetto della condizione sembra essere significativamente diverso da zero (globalmente su tutti i canali). \newline Guardiamo ora, come fatto in precedenza (con il primo metodo di accorpamento), il grafico dei valori della statistica e dei $-log(p-values \ \ aggiustati)$ (secondo il metodo *maxT*) derivati dai test di permutazione, e guardiamo ora a quelli relativi al confronto fra *disgust* e *oggetto* e tra *neutral* e *oggetto* (in figura 21, mentre in figura 22 si mostrano i confronti tra *fear* e *oggetto* e tra *disgust* e *oggetto*) per tutti i canali.
+
+```{r}
+nomi_chans <- names(tbl_2_m)[1:27]
+
+s_m_res2 <- flip.adjust(mod_2_2,method='maxT')@res
+
+t_valz <- matrix(s_m_res2[,2],nrow=4,ncol=27,byrow=FALSE)
+
+data_2 %>% 
+  group_by(condition) %>%
+  summarize_at(channel_names(.),mean) %>%
+  filter(condition %ni% c('f','h')) %>%
+  replace_chan(nomi_chans,t_valz[3:4,]) %>%
+  filter(condition != 'o') %>%
+  plot_topo() +
+  annotate_head() +
+  geom_contour() +
+  geom_text(colour = "black") +
+  facet_grid(~condition,scale='free') +
+  ggtitle('Figura 21: Stat-values test di permutazione multivariata (disgust/neutral vs obj)',
+          subtitle='Dati accorpati con 2° metodo, analisi per canali')
+```
+I grafici, come per il modello adattato sui dati accorpati con il primo metodo, mostrano come siano molto più evidenti le differenze tra lo stimolo della paura e quello dell'oggetto rispetto alle differenze fra lo stimolo della felicità e quello dell'oggetto. In particolare, per quanto riguarda lo stimolo della paura, si ha che risulta esservi una differenza negativa (tra paura e oggetto) nei canali relativi alle aree centro-frontale, centro-parietale, parietale (non P7 e P8) e occipitale, mentre questa differenza risulta essere positiva nelle restanti aree (con l'area parieto-occipitale al limite tra i due tipi di aree, con valori della statistica leggermente negativi)
+
+```{r}
+
+p_valz <- matrix(-log(s_m_res2[,5]),nrow=4,ncol=27,byrow=FALSE)
+
+data_2 %>% 
+  group_by(condition) %>%
+  summarize_at(channel_names(.),mean) %>%
+  filter(condition %ni% c('h','n')) %>%
+  replace_chan(nomi_chans,p_valz[c(1,3),]) %>%
+  filter(condition != 'o') %>%
+  plot_topo() +
+  annotate_head() +
+  geom_contour() +
+  geom_text(colour = "black") +
+  facet_grid(~condition,scale='free') +
+  ggtitle('Figura 22: -log(adj-p-values) test di permutazione multiv. (fear/disgust vs obj)',
+          subtitle='Dati accorpati con 2° metodo, analisi per canali')
+```
+Similmente ai risultati ottenuti sui dati accorpati con il primo metodo, si ha che i $-log(p-values \ \ aggiustati)$ (secondo il metodo *maxT*) per le differenze fra stimoli di disgusto e di paura con quelli dell'oggetto mostrano come le aree in cui queste differenze sono tendenzialmente più marcate sono le aree centrale, frontale e temporale destre (in particolare per lo stimolo della paura). Invece, a differenza della situazione precedente, le aree non incluse in quelle 'significative' (principalmente i canali relativi ai lobi occipitale e parietale) presentano quasi tutte un p-value corretto pari ad 1 (e non solo l'area parieto-occipitale come prima).
+
+## 3° Metodo di accorpamento \newline
+
+Ora accorpiamo le osservazioni utilizzando il terzo metodo (differenza tra il massimo nell'intervallo 50-130 ms e il minimo nell'intervallo 130-200 ms) per vedere le analogie e le diversità con i metodi precedenti
+
+```{r}
+# accorpamento con il terzo metodo
+data_3 <- iso_pick(data_seg, interval_ms = c(50,200), 
+                   sampl_rate_mhz = 500, method = 'min-max')
+```
+
+
+### Analisi per canali \newline
+
+Anche qui passiamo direttamente all'analisi del potenziale fra i vari canali, senza passare per l'analisi per aree cerebrali
+
+```{r}
+# sistemazione dati
+db_3 <- data_3 %>%
+  as_tibble() %>%
+  mutate(.key = factor(.key))
+
+# gestione contrasti
+contrasts(db_3$condition) <- contr.sum
+contrasts(db_3$.key) <- contr.sum
+
+```
+
+#### Modello Lineare \newline
+
+Iniziamo con un modello lineare, utilizzando come covariate: il canale (senza intercetta), la condizione, l'interazione tra canale e condizione e il soggetto
+```{r}
+# modello lineare
+mod_3_1 <- lm(.value~ 0 + .key * condition + .subj,data=db_3)
+Anova(mod_3_1,p.adjust.methods=TRUE,type=3)
+```
+
+Gli effetti di tutte e 4 le variabili introdotte nel modello sono risultati significativamente diversa da zero
+
+```{r}
+summary(glht(mod_3_1, linfct = mcp(condition = 'Tukey'),type='holm'))
+```
+
+```{r}
+summary(mod_3_1)
+```
+C'è da notare che, utilizzando questo metodo di accorpamento, i coefficienti relativi ai canali e alle interazioni tra canale e condizione hanno il verso opposto rispetto a prima (ora se in un canale il picco è negativo, il coefficiente sarà positivo)
+
+```{r message=FALSE, warning=FALSE}
+ggplot(data=data.frame(Residuals = residuals(mod_3_1), 
+       Fitted = fitted.values(mod_3_1), subj=db_3$.subj)) +
+  geom_point(aes(x=Fitted, y=Residuals,color=subj)) + 
+  geom_smooth(aes(x=Fitted, y=Residuals)) +
+  theme(legend.position = "none") +
+  ggtitle('Figura 23: Residuals vs Fitted (per canale)',
+  subtitle='modello lineare su dati accorpati con 3° metodo')
+```
+
+
+
+Dal grafico dei residui emergono dei problemi (relazione non lineare e eteroschedasticità) che, guardando l'istogramma della risposta (figura 24), possono essere dovuti dall'asimettria della sua distribuzione
+
+#### Modello Lineare su dati trasformati \newline
+
+Pertanto, per risolvere il problema,  proviamo ad adattare il modello precedente utilizzando come variabile risposta il $log(potenziale-min(potenziale)+1)$
+
+```{r}
+lp1m <- function(x) log1p(x-min(x))
+db_3 <- db_3 %>% mutate(lpmval = lp1m(.value))
+```
+
+```{r message=FALSE, warning=FALSE}
+ggplot(aes(x = value), data = data.frame(value = c(db_3$.value,db_3$lpmval), 
+        trasf = relevel(factor(c(rep('prima',NROW(db_3)),
+                rep('dopo',NROW(db_3)))),ref='prima'))) +
+  geom_histogram(aes(y = ..density..), colour="black", fill="white",bins=100) +
+  geom_density(alpha=.2, fill="#FF6666") +
+  facet_wrap(~trasf,scale = 'free') +
+  ggtitle('Figura 24: Istogramma e densità della variabile risposta',
+  subtitle='dati accorpati con 3° metodo, risposta prima e dopo la trasformaizone')
+
+```
+Come mostrano gli istogrammi (accompagnati dalla stima non parametrica dela densità) di figura 24, la trasformazione ha ridotto notevolmente l'asimmetria della distribuzione del potenziale, tuttavia ha evidenziato la presenza di una bimodalità: questa è chiaramente causata dal fatto che stiamo guardando la distribuzione complessiva e non stratificata per canale. \newline Adattiamo quindi un modello lineare sui dati trasformati, utilizzando le stesse covariate introdotte nel modello precedente
+
+```{r}
+# modello lineare su risposta trasformata
+mod_3_2 <- lm(lpmval~0+.key*condition+.subj,data=db_3)
+Anova(mod_3_2,type=3,p.adjust.methods=TRUE)
+```
+
+Anche in questo caso l'effetto di tutte le variabili introdotte nel modello è risultato essere significativamente diverso da zero
+
+```{r message=FALSE, warning=FALSE}
+ggplot(data=data.frame(Residuals = residuals(mod_3_2), 
+       Fitted = fitted.values(mod_3_2), subj=db_3$.subj)) +
+  geom_point(aes(x=Fitted, y=Residuals,color=subj)) + 
+  geom_smooth(aes(x=Fitted, y=Residuals)) +
+  theme(legend.position = "none") +
+  ggtitle('Figura 25: Residuals vs Fitted (per canale)',
+  subtitle='modello lineare su dati accorpati con 3° metodo e trasformati')
+```
+```{r}
+summary(mod_3_1)$adj.r.squared
+summary(mod_3_2)$adj.r.squared
+```
+
+```{r}
+db_3 %>% cbind(.resid = residuals(mod_3_2)) %>%
+  ggplot(aes(condition,.resid)) +
+  geom_point(aes(group = .subj, colour = .subj),
+             size=2,show.legend = FALSE) +
+  geom_line(aes(group = .subj, colour = .subj),
+            show.legend = FALSE) +
+  geom_boxplot(alpha=.1) +
+  facet_wrap(~.key, scale = 'free') +
+  ggtitle('Figura 26: Boxplot Residui (per canale)',
+  subtitle='modello lineare su dati accorpati con 3° metodo e trasformati')
+```
+
+
+Sia il grafico dei residui (figura 25) che l'$R^2$ corretto suggeriscono un miglior adattamento del modello lineare sui dati trasformati rispetto a quello sui dati non trasformati. \newline Tuttavia introducendo l'effetto del soggetto semplicemente come covariata (fissa) nel modello, anche con i dati accorpati in questo modo, non teniamo in considerazione al meglio l'effetto soggetto-specifico (come si vede anche da figura 26); inoltre non stiamo neppure prendendo in considerazione la correlazione tra i canali
+
+#### Modello Lineare ad Effetti Misti su dati trasformati \newline
+
+Pertanto, per cercare di risolvere i due problemi sopracitati (principalmente l'effetto soggetto-specifico), come nei casi dei due accorpamenti precedenti, è stato adattato un modello lineare ad effetti misti con intercette casuali specfiche per soggetto e coefficienti casuali relativi ai canali. Data l'elevata asimmetria della distribuzione della risposta, il modello è stato adattato sulla sua trasformazione utilizzata anche nel modello precedente
+```{r}
+mod_3_3 <- gam(lpmval~0+ .key * condition + s(.key, .subj, bs = 're'),
+                data = db_3, method = 'REML')
+anova(mod_3_3)
+```
+Anche in questo caso la riduzione di varianza residua apportata dall'introduzione di tutte le variabili nel modello è risultata essere significativamente diversa da zero
+
+```{r}
+summary(mod_3_3)
+```
+Anche qui, come nel modello ad effetti misti adattato sui dati accorpati con la media, si ha che i coefficienti dei parametri risultati significativamente diversi da zero sono principalmente quelli relativi ai canali e alle interazioni tra sitmolo fear/disgust (differenza tra fear/disgust e object) e i canali (con qualche rara eccezione per le interazioni tra canale e gli altri due stimoli). Inoltre sono risultati significativamente diversi da zero anche i coefficienti relativi agli effetti principali delle condizioni *fear, happiness e disgust* (coefficienti relativi alle differenze tra questi stimoli e lo stimolo dell'*oggetto*) e con segno positivo: dato che questo metodo di accorpamento 'inverte' i segni rispetto al metodo precedente, si ha che l'effetto principale degli stimoli riguarda principalmente i canali con il picco negativo
+
+
+```{r message=FALSE, warning=FALSE}
+ggplot(data=data.frame(Residuals = residuals(mod_3_2), 
+       Fitted = fitted.values(mod_3_2), subj=db_3$.subj)) +
+  geom_point(aes(x=Fitted, y=Residuals,color=subj)) + 
+  geom_smooth(aes(x=Fitted, y=Residuals)) +
+  theme(legend.position = "none") +
+  ggtitle('Figura 27: Residuals vs Fitted (per canale)',
+  subtitle='modello lineare ad effetti misti su dati accorpati con 3° metodo e trasformati')
+```
+
+```{r}
+db_3 %>% cbind(.resid = residuals(mod_3_3)) %>%
+  ggplot(aes(condition,.resid)) +
+  geom_point(aes(group = .subj, colour = .subj),
+             size=2,show.legend = FALSE) +
+  geom_line(aes(group = .subj, colour = .subj),
+            show.legend = FALSE) +
+  geom_boxplot(alpha=.1) +
+  facet_wrap(~.key, scale = 'free') +
+  ggtitle('Figura 28: Boxplot Residui (per canale)',
+  subtitle='modello lineare ad effetti misti su dati accorpati con 3° metodo e trasformati')
+```
+
+```{r}
+AIC(mod_3_2)
+AIC(mod_3_3)
+```
+
+Guardando il grafico e i boxplot dei residui si può vedere come questo modello presenti un buon adattamento e sia riuscito a cogliere gli effetti soggetto-specifici, cosa che non era stato in grado di fare il modello ad effetti fissi: questi fatti, accompagnati da una notevole riduzione nell'AIC, fanno prediligere anche per questo metodo di accorpamento il modello ad effetti misti rispetto al semplice modello lineare
+
+```{r}
+tibble(.residuals = db_3$lpmval, .key = db_3$.key) %>%
+  pivot_wider(names_from = .key, values_from = .residuals) %>%
+  apply(2,unlist) %>% ggcorr() + 
+  ggtitle('Figura 29: Correlazione tra il Potenziale nei vari Canali',
+  subtitle='modello lineare ad effetti misti su dati accorpati con 3° metodo e trasformati')
+```
+
+```{r}
+tibble(.residuals = residuals(mod_3_3), .key = db_3$.key) %>%
+  pivot_wider(names_from = .key, values_from = .residuals) %>%
+  apply(2,unlist) %>% ggcorr() + 
+  ggtitle('Figura 30: Correlazione tra i Residui Stratificati (per canale)',
+  subtitle='modello lineare ad effetti misti su dati accorpati con 3° metodo e trasformati')
+```
+Inoltre, guardando i grafici delle correlazioni fra i canali "prima e dopo" la modellizzazione, si vede che utilizzando un modello ad effetti misti e il terzo metodo di accorpamento (con potenziale trasformato) viene colta maggiormente la correlazione fra canali rispetto ai primi due metodi di accorpamento 
+
+
+#### Test di Permutazione Multivariati su dati trasformati \newline
+
+Finiamo con un test di permutazione multivariato, effettuato sui dati accorpati con il terzo metodo e trasformati
+
+```{r}
+# trasformazione tibble in wide-format
+tbl_3_m <- data.frame(matrix(unlist(tapply(db_3$lpmval,db_3$.key,
+                                           function(x) x)),nrow=100,ncol=27),
+                      tapply(db_3$condition,db_3$.key,function(x) x)$C4,
+                      tapply(db_3$.subj,db_3$.key,function(x) x)$C4)
+
+colnames(tbl_3_m) <- c(unique(as.character(db_3$.key)),'condition','.subj')
+tbl_3_m$condition <- relevel(tbl_3_m$condition, ref = 'o')
+
+
+```
+
+Anche in questo caso trattiamo il soggetto come una variabile confondente
+```{r}
+mod_3_4 <- flip(.~condition, Z=~.subj, data=tbl_3_m, perms=1000) # Strata = ~.subj
+summary(flip.adjust(mod_3_4,method='maxT'))
+
+```
+
+
+```{r}
+npc(mod_3_4)
+```
+
+Anche attuando una procedura di controllo della molteplicità basata sul *fdr*, solo 3 singoli coefficienti testati sono risultati essere significativamente diversi da zero; inoltre, nel complesso, l'effetto della condizione non sembra essere significativamente diverso da zero (globalmente su tutti i canali, ad un livello di significatività del 5%), differentemente da quanto è accaduto con i test di permutazione effettutati sui dati accorpati con i metodi precedenti
+
+```{r}
+
+nomi_chans <- names(tbl_3_m)[1:27]
+s_m_res3 <- flip.adjust(mod_3_4,method='fdr')@res
+t_valz <- matrix(s_m_res3[,2],nrow=4,ncol=27,byrow=FALSE)
+
+data_3 %>% 
+  group_by(condition) %>%
+  summarize_at(channel_names(.),mean) %>%
+  filter(condition %ni% c('f','h')) %>%
+  replace_chan(nomi_chans,t_valz[3:4,]) %>%
+  filter(condition != 'o') %>%
+  plot_topo() +
+  annotate_head() +
+  geom_contour() +
+  geom_text(colour = "black") +
+  facet_grid(~condition,scale='free') +
+  ggtitle('Figura 31: Stat-values test di permutazione multivariata (disgust/neutral vs obj)',
+          subtitle='Dati accorpati con 3° metodo e trasformati, analisi per canali')
+```
+
+I grafici, come per il modello adattato sui dati accorpati con i primi due metodi, mostrano come siano molto più evidenti le differenze tra lo stimolo della paura e quello dell'oggetto rispetto alle differenze fra lo stimolo della felicità e quello dell'oggetto. In particolare, per quanto riguarda lo stimolo della paura, si ha che risulta esservi una differenza negativa (tra paura e oggetto) nei canali relativi principalmente alle aree occipitale, parietale (non P7 e P8), parieto-occipitale e centro-frontale: per queste differenze fra stimoli il valore della statistica è positivo indicando appunto i canali con il picco negativo (dovuto appunto all'inversione del segno causata da questo metodo di accorpamento, come notato in precedenza)
+
+
+```{r}
+p_valz <- matrix(-log(s_m_res3[,5]),nrow=4,ncol=27,byrow=FALSE)
+data_3 %>% 
+  group_by(condition) %>%
+  summarize_at(channel_names(.),mean) %>%
+  filter(condition %ni% c('h','n')) %>%
+  replace_chan(nomi_chans,p_valz[c(1,3),]) %>%
+  filter(condition != 'o') %>%
+  plot_topo() +
+  annotate_head() +
+  geom_contour() +
+  geom_text(colour = "black") +
+  facet_grid(~condition,scale='free') +
+  ggtitle('Figura 32: -log(adj-p-values) test di permutazione multiv. (fear/disgust vs obj)',
+          subtitle='Dati accorpati con 3° metodo e trasformati, analisi per canali')
+```
+
+Diversamete dai risultati ottenuti sui dati accorpati con i primi due metodi, si ha che i $-log(p-values \ \ aggiustati)$ (secondo il metodo *fdr*) relativi alle differenze fra stimoli di disgusto e di paura con quelli dell'oggetto mostrano come le aree in cui queste differenze sono tendenzialmente più marcate sono quelle occipitale, parietale (non P7 e P8) e centro-frontale: queste aree, in particolare per quanto riguarda lo stimolo del disgusto contro quello della paura, erano state individuate come quelle "meno significative" (dall'ordinamento indotto dai p-values aggiustati) dal precedente metodo di accorpamento, mostrando quindi come i due metodi intercettino in maniera più efficace le differenze di potenziale tra alcuni tipi di aree rispetto ad altre (picco positivo o negativo).
+
+# Conclusioni \newline
+
+Queste analisi hanno mostrato in primis che utilizzando il pacchetto *eeguana* in sincrono con le librerie 'core' del *tidyverse* si possono effettuare comodamente tutte le analisi esplorative/statistiche usuali sui dati derivati da un *ERP experiment*. \newline Inoltre sono stati adattati vari metodi e modelli per cercare di cogliere al meglio le peculiarità di questi dati. In particolare sono stati utilizzati modelli ad effetti misti e test di permutazione multivariati per cercare di cogliere sia l'effetto dovuto alla specificità dei soggetti, che l'effetto dovuto alla correlazione tra i vari canali/aree cerebrali: i risultati mostrano che spesso è stato raggiunto un notevole adattamento dei modelli ai dati e che in parte le problematicità (peculiarità) presenti nei dati sono state risolte (colte). \newline Infine sono stati confrontati tre diversi metodi per accorpare i dati attorno al 'picco dello stimolo' e, principalmente dai risultati ottenuti con i modelli lineari ad effetti misti e con i test di permutazione, è emerso che: il primo metodo sembra non enfatizzare nessun tipo di picco in particolare, il secondo metodo sembra enfatizzare maggiormente i picchi positivi (più precisamente sembra enfatizzare maggiormente le differenze tra stimoli in aree/canali che presentano un picco del potenziale positivo in risposta allo stimolo) e il terzo metodo sembra enfatizzare maggiormente quelli negativi. \newline Quindi, da quello che mostra quest'analisi, si può concludere dicendo che la selezione del metodo di accorpamento dovrebbe essere guidata da informazioni a priori (interesse è P170/N170 allora 2°/3° metodo, sennò accorpo con la media), e che utilizzare modelli ad effetti casuali e/o test di permutazione multivariati, rispetto a semplici modelli lineari, aiuta a tenere in considerazione le caratteristiche tipiche di dati derivati da *eeg*.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
